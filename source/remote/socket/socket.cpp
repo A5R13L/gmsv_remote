@@ -51,13 +51,18 @@ void SocketServer::Connect(const std::string &_RelayURL, const std::string &_Pas
             Logger::Log(Logger::Info("Relay connection established. Announcing server..."));
 
             std::string ServerAddress = Functions::GetServerAddress();
+            bool Notified = false;
 
-            if (ServerAddress.find("0.0.0.0") != std::string::npos)
+            while (ServerAddress.find("0.0.0.0") != std::string::npos)
             {
-                Logger::Log(Logger::Warning("Not connected to steam. Waiting..."));
+                if (!Notified)
+                {
+                    Logger::Log(Logger::Warning("Not connected to steam. Waiting..."));
+                    Notified = true;
+                }
 
-                while ((ServerAddress = Functions::GetServerAddress()).find("0.0.0.0") != std::string::npos)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                ServerAddress = Functions::GetServerAddress();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
 
             g_WebSocket.sendText(JSON::Stringify({
