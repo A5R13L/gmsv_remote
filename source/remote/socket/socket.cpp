@@ -284,36 +284,32 @@ void SocketServer::HandleRead(std::string ClientId, int RequestId, const nlohman
 
     size_t FileSize = std::filesystem::file_size(FullPath);
 
-    if (Offset > FileSize)
-    {
-        Response["success"] = false;
-        return this->SendRPCResponse(ClientId, RequestId, Response);
-    }
-
     std::vector<char> Buffer(Length);
+    std::string FileContents;
+    std::streamsize BytesRead = 0;
+    bool EOFReached = false;
 
-    FileStream.seekg(Offset, std::ios::beg);
-    FileStream.read(Buffer.data(), Length);
+    if (FileSize > 0 && Offset < FileSize && Offset + Length <= FileSize)
+    {
+        FileStream.seekg(Offset, std::ios::beg);
+        FileStream.read(Buffer.data(), Length);
 
-    std::streamsize BytesRead = FileStream.gcount();
-    bool EOFReached = (Offset + BytesRead) >= FileSize;
+        BytesRead = FileStream.gcount();
+        EOFReached = (Offset + BytesRead) >= FileSize;
 
-    Buffer.resize(BytesRead);
+        Buffer.resize(BytesRead);
 
-    std::string FileContents = std::string(Buffer.data(), BytesRead);
+        FileContents = std::string(Buffer.data(), BytesRead);
+    }
 
     Response["success"] = true;
     Response["bytes"] = BytesRead;
     Response["eof"] = EOFReached;
 
     this->SendRPCResponse(ClientId, RequestId, Response);
-
-    if (BytesRead > 0)
-    {
-        this->StartRPCStream(ClientId, RequestId);
-        this->SendRPCStreamChunk(ClientId, RequestId, FileContents);
-        this->StopRPCStream(ClientId, RequestId);
-    }
+    this->StartRPCStream(ClientId, RequestId);
+    this->SendRPCStreamChunk(ClientId, RequestId, FileContents);
+    this->StopRPCStream(ClientId, RequestId);
 }
 
 void SocketServer::HandleWrite(std::string ClientId, int RequestId, const nlohmann::json &Payload)
