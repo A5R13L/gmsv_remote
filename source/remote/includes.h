@@ -16,7 +16,7 @@
 #include <regex>
 #include <set>
 #include <queue>
-#include <json.hpp>
+#include <nlohmann_json.hpp>
 #include <base64.hpp>
 #include <IXWebSocket.h>
 #include <IXNetSystem.h>
@@ -24,6 +24,8 @@
 #ifndef REMOTE_VERSION
 #define REMOTE_VERSION "unknown"
 #endif
+
+#undef max
 
 namespace Remote
 {

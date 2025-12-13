@@ -4,14 +4,14 @@
 #include "../json/json.hpp"
 #include "../util.hpp"
 
-#undef max
-
 namespace Remote::Socket
 {
 static ix::WebSocket g_WebSocket;
 static std::map<std::string, int> CurrentRequestIDs;
-static size_t MAX_PENDING_BYTES = 32 * 1024;
-static auto MAX_CHUNK_DELAY = std::chrono::milliseconds(750);
+static size_t SEARCH_RESULT_CHUNK_MAX_SIZE = 32 * 1024;
+static auto SEARCH_RESULT_CHUNK_INTERVAL = std::chrono::milliseconds(750);
+static size_t FILE_READ_CHUNK_BYTES = 256 * 1024;
+static auto FILE_READ_CHUNK_INTERVAL = std::chrono::milliseconds(15);
 SocketServer SocketServer::Singleton;
 
 static size_t EstimatePacketSize(const nlohmann::json &Object)
@@ -38,8 +38,9 @@ void SocketServer::Connect(const std::string &_RelayURL, const std::string &_Pas
     TLSOptions.caFile = "NONE";
 
     g_WebSocket.setTLSOptions(TLSOptions);
-    g_WebSocket.setUrl(_RelayURL);
     g_WebSocket.setExtraHeaders({{"Sec-WebSocket-Protocol", "gmsv_remote"}});
+    g_WebSocket.setUrl(_RelayURL);
+    g_WebSocket.disablePerMessageDeflate();
     g_WebSocket.enablePong();
     g_WebSocket.enableAutomaticReconnection();
     g_WebSocket.setPingInterval(5);
@@ -147,7 +148,7 @@ void SocketServer::HandlePacket(const nlohmann::json &Packet)
         if (Action == "FS.ListFiles")
             this->HandleListFiles(ClientId, RequestId, Payload);
         else if (Action == "FS.Read")
-            this->HandleRead(ClientId, RequestId, Payload);
+            std::thread(&SocketServer::HandleRead, this, ClientId, RequestId, Payload).detach();
         else if (Action == "FS.Write")
             this->HandleWrite(ClientId, RequestId, Payload);
         else if (Action == "FS.Delete")
@@ -156,6 +157,8 @@ void SocketServer::HandlePacket(const nlohmann::json &Packet)
             this->HandleMkdir(ClientId, RequestId, Payload);
         else if (Action == "FS.Rename")
             this->HandleRename(ClientId, RequestId, Payload);
+        else if (Action == "FS.Copy")
+            this->HandleCopy(ClientId, RequestId, Payload);
         else if (Action == "FS.Move")
             this->HandleMove(ClientId, RequestId, Payload);
         else if (Action == "FS.Exists")
@@ -225,10 +228,18 @@ void SocketServer::HandleListFiles(std::string ClientId, int RequestId, const nl
     std::string FullPath = Functions::VFSPathToFullPath(Path);
     nlohmann::json Response = nlohmann::json::object();
 
-    if (Path.empty() || FullPath.empty() || !std::filesystem::exists(FullPath))
+    bool FileExists = std::filesystem::exists(FullPath);
+    bool IsDirectory = std::filesystem::is_directory(FullPath);
+
+    if (Path.empty() || FullPath.empty() || !FileExists || !IsDirectory)
     {
-        Logger::Log(Logger::Error("Failed to list files: {red}%s{white}"), Path.c_str());
         Response["success"] = false;
+
+        if (!FileExists)
+            Response["error_code"] = "file_not_found";
+        else if (!IsDirectory)
+            Response["error_code"] = "not_a_directory";
+
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
@@ -258,57 +269,69 @@ void SocketServer::HandleRead(std::string ClientId, int RequestId, const nlohman
     std::string FullPath = Functions::VFSPathToFullPath(Path);
     nlohmann::json Response = nlohmann::json::object();
 
-    if (Path.empty() || !std::filesystem::exists(FullPath) || !std::filesystem::is_regular_file(FullPath))
+    bool FileExists = std::filesystem::exists(FullPath);
+    bool IsRegularFile = std::filesystem::is_regular_file(FullPath);
+
+    if (Path.empty() || !FileExists || !IsRegularFile)
     {
         Response["success"] = false;
+
+        if (!FileExists)
+            Response["error_code"] = "file_not_found";
+        else if (!IsRegularFile)
+            Response["error_code"] = "not_a_file";
+
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
-
-    int Offset = JSON::Integer(Payload, "offset");
-
-    if (!JSON::ValidInteger(Offset))
-        Offset = 0;
-
-    int Length = JSON::Integer(Payload, "length");
-
-    if (!JSON::ValidInteger(Length))
-        Length = 0;
 
     std::ifstream FileStream(FullPath, std::ios::binary);
 
     if (!FileStream)
     {
         Response["success"] = false;
+        Response["error_code"] = "file_not_found";
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
-    size_t FileSize = std::filesystem::file_size(FullPath);
-
-    std::vector<char> Buffer(Length);
-    std::string FileContents;
-    std::streamsize BytesRead = 0;
-    bool EOFReached = false;
-
-    if (FileSize > 0 && Offset < FileSize && Offset + Length <= FileSize)
-    {
-        FileStream.seekg(Offset, std::ios::beg);
-        FileStream.read(Buffer.data(), Length);
-
-        BytesRead = FileStream.gcount();
-        EOFReached = (Offset + BytesRead) >= FileSize;
-
-        Buffer.resize(BytesRead);
-
-        FileContents = std::string(Buffer.data(), BytesRead);
-    }
-
     Response["success"] = true;
-    Response["bytes"] = BytesRead;
-    Response["eof"] = EOFReached;
 
     this->SendRPCResponse(ClientId, RequestId, Response);
+
+    size_t FileSize = std::filesystem::file_size(FullPath);
+
+    if (FileSize == 0)
+    {
+        std::string EmptyBuffer = "";
+
+        this->StartRPCStream(ClientId, RequestId);
+        this->SendRPCStreamChunk(ClientId, RequestId, EmptyBuffer);
+        this->StopRPCStream(ClientId, RequestId);
+        return;
+    }
+
+    std::vector<char> ChunkBuffer(FILE_READ_CHUNK_BYTES);
+
     this->StartRPCStream(ClientId, RequestId);
-    this->SendRPCStreamChunk(ClientId, RequestId, FileContents);
+    auto NextChunkTime = std::chrono::steady_clock::now();
+    std::string ChunkString(FILE_READ_CHUNK_BYTES, '\0');
+
+    while (FileStream)
+    {
+        std::this_thread::sleep_until(NextChunkTime);
+        FileStream.read(ChunkBuffer.data(), ChunkBuffer.size());
+
+        std::streamsize BytesRead = FileStream.gcount();
+
+        if (BytesRead <= 0)
+            break;
+
+        ChunkString.resize(BytesRead);
+        std::memcpy(ChunkString.data(), ChunkBuffer.data(), BytesRead);
+        this->SendRPCStreamChunk(ClientId, RequestId, ChunkString);
+
+        NextChunkTime = std::max(NextChunkTime + FILE_READ_CHUNK_INTERVAL, std::chrono::steady_clock::now());
+    }
+
     this->StopRPCStream(ClientId, RequestId);
 }
 
@@ -321,6 +344,8 @@ void SocketServer::HandleWrite(std::string ClientId, int RequestId, const nlohma
     if (Path.empty() || FullPath.empty())
     {
         Response["success"] = false;
+        Response["error_code"] = "file_not_found";
+
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
@@ -344,6 +369,7 @@ void SocketServer::HandleWrite(std::string ClientId, int RequestId, const nlohma
     FileStream.write(DecodedData.data(), DecodedData.size());
 
     Response["success"] = true;
+
     this->SendRPCResponse(ClientId, RequestId, Response);
 }
 
@@ -353,9 +379,13 @@ void SocketServer::HandleDelete(std::string ClientId, int RequestId, const nlohm
     std::string FullPath = Functions::VFSPathToFullPath(Path);
     nlohmann::json Response = nlohmann::json::object();
 
-    if (Path.empty() || FullPath.empty() || !std::filesystem::exists(FullPath))
+    bool FileExists = std::filesystem::exists(FullPath);
+
+    if (Path.empty() || FullPath.empty() || !FileExists)
     {
         Response["success"] = false;
+        Response["error_code"] = "file_not_found";
+
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
@@ -382,9 +412,12 @@ void SocketServer::HandleMkdir(std::string ClientId, int RequestId, const nlohma
     std::string FullPath = Functions::VFSPathToFullPath(Path);
     nlohmann::json Response = nlohmann::json::object();
 
-    if (Path.empty() || FullPath.empty() || std::filesystem::exists(FullPath))
+    bool DirectoryExists = std::filesystem::exists(FullPath);
+
+    if (Path.empty() || FullPath.empty() || DirectoryExists)
     {
         Response["success"] = false;
+        Response["error_code"] = "directory_already_exists";
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
@@ -408,10 +441,18 @@ void SocketServer::HandleRename(std::string ClientId, int RequestId, const nlohm
     std::string ToFullPath = Functions::VFSPathToFullPath(To);
     nlohmann::json Response = nlohmann::json::object();
 
-    if (From.empty() || To.empty() || FromFullPath.empty() || ToFullPath.empty() ||
-        !std::filesystem::exists(FromFullPath) || std::filesystem::exists(ToFullPath))
+    bool FromFileExists = std::filesystem::exists(FromFullPath);
+    bool ToFileExists = std::filesystem::exists(ToFullPath);
+
+    if (From.empty() || To.empty() || FromFullPath.empty() || ToFullPath.empty() || !FromFileExists || ToFileExists)
     {
         Response["success"] = false;
+
+        if (!FromFileExists)
+            Response["error_code"] = "file_not_found";
+        else if (ToFileExists)
+            Response["error_code"] = "file_already_exists";
+
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
@@ -419,6 +460,43 @@ void SocketServer::HandleRename(std::string ClientId, int RequestId, const nlohm
     {
         std::filesystem::create_directories(std::filesystem::path(ToFullPath).parent_path());
         std::filesystem::rename(FromFullPath, ToFullPath);
+        Response["success"] = true;
+    }
+    catch (...)
+    {
+        Response["success"] = false;
+    }
+
+    this->SendRPCResponse(ClientId, RequestId, Response);
+}
+
+void SocketServer::HandleCopy(std::string ClientId, int RequestId, const nlohmann::json &Payload)
+{
+    std::string From = JSON::String(Payload, "from");
+    std::string FromFullPath = Functions::VFSPathToFullPath(From);
+    std::string To = JSON::String(Payload, "to");
+    std::string ToFullPath = Functions::VFSPathToFullPath(To);
+    nlohmann::json Response = nlohmann::json::object();
+
+    bool FromFileExists = std::filesystem::exists(FromFullPath);
+    bool ToFileExists = std::filesystem::exists(ToFullPath);
+
+    if (From.empty() || To.empty() || FromFullPath.empty() || ToFullPath.empty() || !FromFileExists || ToFileExists)
+    {
+        Response["success"] = false;
+
+        if (!FromFileExists)
+            Response["error_code"] = "file_not_found";
+        else if (ToFileExists)
+            Response["error_code"] = "file_already_exists";
+
+        return this->SendRPCResponse(ClientId, RequestId, Response);
+    }
+
+    try
+    {
+        std::filesystem::create_directories(std::filesystem::path(ToFullPath).parent_path());
+        std::filesystem::copy(FromFullPath, ToFullPath);
         Response["success"] = true;
     }
     catch (...)
@@ -437,10 +515,18 @@ void SocketServer::HandleMove(std::string ClientId, int RequestId, const nlohman
     std::string ToFullPath = Functions::VFSPathToFullPath(To);
     nlohmann::json Response = nlohmann::json::object();
 
-    if (From.empty() || To.empty() || FromFullPath.empty() || ToFullPath.empty() ||
-        !std::filesystem::exists(FromFullPath) || std::filesystem::exists(ToFullPath))
+    bool FromFileExists = std::filesystem::exists(FromFullPath);
+    bool ToFileExists = std::filesystem::exists(ToFullPath);
+
+    if (From.empty() || To.empty() || FromFullPath.empty() || ToFullPath.empty() || !FromFileExists || ToFileExists)
     {
         Response["success"] = false;
+
+        if (!FromFileExists)
+            Response["error_code"] = "file_not_found";
+        else if (ToFileExists)
+            Response["error_code"] = "file_already_exists";
+
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
@@ -467,6 +553,7 @@ void SocketServer::HandleExists(std::string ClientId, int RequestId, const nlohm
     if (Path.empty() || FullPath.empty())
     {
         Response["success"] = false;
+
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
@@ -485,6 +572,7 @@ void SocketServer::HandleStat(std::string ClientId, int RequestId, const nlohman
     if (Path.empty() || FullPath.empty())
     {
         Response["success"] = false;
+
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
@@ -515,10 +603,18 @@ void SocketServer::HandleTruncate(std::string ClientId, int RequestId, const nlo
     std::string FullPath = Functions::VFSPathToFullPath(Path);
     nlohmann::json Response = nlohmann::json::object();
 
-    if (Path.empty() || FullPath.empty() || !std::filesystem::exists(FullPath) ||
-        !std::filesystem::is_regular_file(FullPath))
+    bool FileExists = std::filesystem::exists(FullPath);
+    bool IsRegularFile = std::filesystem::is_regular_file(FullPath);
+
+    if (Path.empty() || FullPath.empty() || !FileExists || !IsRegularFile)
     {
         Response["success"] = false;
+
+        if (!FileExists)
+            Response["error_code"] = "file_not_found";
+        else if (!IsRegularFile)
+            Response["error_code"] = "not_a_file";
+
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
@@ -527,12 +623,14 @@ void SocketServer::HandleTruncate(std::string ClientId, int RequestId, const nlo
     if (!JSON::ValidInteger(Size) || Size < 0 || Size >= std::filesystem::file_size(FullPath))
     {
         Response["success"] = false;
+
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
     try
     {
         std::filesystem::resize_file(FullPath, Size);
+
         Response["success"] = true;
     }
     catch (...)
@@ -546,7 +644,6 @@ void SocketServer::HandleTruncate(std::string ClientId, int RequestId, const nlo
 void SocketServer::HandleSearch(std::string ClientId, int RequestId, const nlohmann::json &Payload)
 {
     static std::set<std::string> AllowedTextExtensions = {".txt", ".cfg", ".lua", ".ini", ".json", ".disabled", ".log"};
-
     static std::map<std::string, int> CurrentSearchIDs;
 
     std::string Query = JSON::String(Payload, "query");
@@ -657,6 +754,7 @@ void SocketServer::HandleSearch(std::string ClientId, int RequestId, const nlohm
             if (!Chunk.empty())
             {
                 std::lock_guard<std::mutex> Lock(QueueMutex);
+
                 Queue.push(std::move(Chunk));
                 QueueSignal.notify_one();
             }
@@ -671,7 +769,7 @@ void SocketServer::HandleSearch(std::string ClientId, int RequestId, const nlohm
 
     nlohmann::json Pending = nlohmann::json::array();
     size_t PendingBytes = 0;
-    auto LastSend = std::chrono::steady_clock::now();
+    auto LastResultSent = std::chrono::steady_clock::now() - SEARCH_RESULT_CHUNK_INTERVAL;
 
     while (true)
     {
@@ -691,7 +789,7 @@ void SocketServer::HandleSearch(std::string ClientId, int RequestId, const nlohm
             {
                 size_t Size = EstimatePacketSize(Match);
 
-                if (PendingBytes + Size > MAX_PENDING_BYTES)
+                if (PendingBytes + Size > SEARCH_RESULT_CHUNK_MAX_SIZE)
                     break;
 
                 Pending.push_back(std::move(Match));
@@ -703,12 +801,12 @@ void SocketServer::HandleSearch(std::string ClientId, int RequestId, const nlohm
 
         auto Now = std::chrono::steady_clock::now();
 
-        if (!Pending.empty() && Now - LastSend >= MAX_CHUNK_DELAY)
+        if (!Pending.empty() && Now - LastResultSent >= SEARCH_RESULT_CHUNK_INTERVAL)
         {
             this->SendRPCStreamChunk(ClientId, RequestId, Pending);
             Pending.clear();
             PendingBytes = 0;
-            LastSend = Now;
+            LastResultSent = Now;
         }
 
         if (Active.load() == 0)
@@ -728,9 +826,5 @@ void SocketServer::HandleSearch(std::string ClientId, int RequestId, const nlohm
         this->SendRPCStreamChunk(ClientId, RequestId, Pending);
 
     this->StopRPCStream(ClientId, RequestId);
-}
-
-void SocketServer::HandleReplace(std::string ClientId, int RequestId, const nlohmann::json &Payload)
-{
 }
 } // namespace Remote::Socket

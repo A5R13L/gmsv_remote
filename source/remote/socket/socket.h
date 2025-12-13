@@ -29,7 +29,6 @@ class SocketServer
     void HandleStat(std::string ClientId, int RequestId, const nlohmann::json &Payload);
     void HandleTruncate(std::string ClientId, int RequestId, const nlohmann::json &Payload);
     void HandleSearch(std::string ClientId, int RequestId, const nlohmann::json &Payload);
-    void HandleReplace(std::string ClientId, int RequestId, const nlohmann::json &Payload);
 
   private:
     bool Connected = false;
