@@ -50,6 +50,16 @@ void SocketServer::Connect(const std::string &_RelayURL, const std::string &_Pas
         {
             Logger::Log(Logger::Info("Relay connection established. Announcing server..."));
 
+            std::string ServerAddress = Functions::GetServerAddress();
+
+            if (ServerAddress.find("0.0.0.0") != std::string::npos)
+            {
+                Logger::Log(Logger::Warning("Not connected to steam. Waiting..."));
+
+                while ((ServerAddress = Functions::GetServerAddress()).find("0.0.0.0") != std::string::npos)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
             g_WebSocket.sendText(JSON::Stringify({
                 {"type", "server_announce"},
                 {"serverAddress", Functions::GetServerAddress()},
@@ -225,9 +235,11 @@ void SocketServer::HandleListFiles(std::string ClientId, int RequestId, const nl
         nlohmann::json EntryObject = nlohmann::json::object({
             {"name", Entry.path().filename().string()},
             {"type", Entry.is_directory() ? "directory" : "File"},
-            {"size", Entry.file_size()},
             {"lastModified", std::filesystem::last_write_time(Entry.path()).time_since_epoch().count()},
         });
+
+        if (!Entry.is_directory())
+            EntryObject["size"] = Entry.file_size();
 
         Response["entries"].push_back(EntryObject);
     }
@@ -241,7 +253,7 @@ void SocketServer::HandleRead(std::string ClientId, int RequestId, const nlohman
     std::string FullPath = Functions::VFSPathToFullPath(Path);
     nlohmann::json Response = nlohmann::json::object();
 
-    if (Path.empty() || !std::filesystem::exists(FullPath) || std::filesystem::is_directory(FullPath))
+    if (Path.empty() || !std::filesystem::exists(FullPath) || !std::filesystem::is_regular_file(FullPath))
     {
         Response["success"] = false;
         return this->SendRPCResponse(ClientId, RequestId, Response);
@@ -477,8 +489,13 @@ void SocketServer::HandleStat(std::string ClientId, int RequestId, const nlohman
 
     try
     {
-        Response["type"] = std::filesystem::is_directory(FullPath) ? "directory" : "File";
-        Response["size"] = std::filesystem::file_size(FullPath);
+        bool IsDirectory = std::filesystem::is_directory(FullPath);
+
+        Response["type"] = IsDirectory ? "directory" : "file";
+
+        if (!IsDirectory)
+            Response["size"] = std::filesystem::file_size(FullPath);
+
         Response["created"] = std::filesystem::last_write_time(FullPath).time_since_epoch().count();
         Response["modified"] = std::filesystem::last_write_time(FullPath).time_since_epoch().count();
         Response["success"] = true;
@@ -497,7 +514,8 @@ void SocketServer::HandleTruncate(std::string ClientId, int RequestId, const nlo
     std::string FullPath = Functions::VFSPathToFullPath(Path);
     nlohmann::json Response = nlohmann::json::object();
 
-    if (Path.empty() || FullPath.empty() || !std::filesystem::exists(FullPath))
+    if (Path.empty() || FullPath.empty() || !std::filesystem::exists(FullPath) ||
+        !std::filesystem::is_regular_file(FullPath))
     {
         Response["success"] = false;
         return this->SendRPCResponse(ClientId, RequestId, Response);
