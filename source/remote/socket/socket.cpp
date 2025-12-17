@@ -620,9 +620,16 @@ void SocketServer::HandleTruncate(std::string ClientId, int RequestId, const nlo
 
     int Size = JSON::Integer(Payload, "size");
 
-    if (!JSON::ValidInteger(Size) || Size < 0 || Size >= std::filesystem::file_size(FullPath))
+    if (!JSON::ValidInteger(Size) || Size < 0)
     {
         Response["success"] = false;
+
+        return this->SendRPCResponse(ClientId, RequestId, Response);
+    }
+
+    if (Size >= std::filesystem::file_size(FullPath))
+    {
+        Response["success"] = true;
 
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }

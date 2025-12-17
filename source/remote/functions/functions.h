@@ -4,6 +4,7 @@
 namespace Remote::Functions
 {
 extern std::string g_RemoteEncryptionKey;
+extern std::string g_LogActivity;
 
 std::string RandomString(int Length);
 std::string GetServerAddress();
