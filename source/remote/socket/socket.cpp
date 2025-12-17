@@ -33,7 +33,9 @@ void SocketServer::Connect(const std::string &_RelayURL, const std::string &_Pas
     this->RelayURL = _RelayURL;
     this->Password = _Password;
 
-#ifdef SYSTEM_LINUX || __linux__
+#if defined(SYSTEM_LINUX) || defined(__linux__)
+    Logger::Log(Logger::Info("Disabling TLS certificate validation..."));
+
     ix::SocketTLSOptions TLSOptions;
     TLSOptions.disable_hostname_validation = true;
     TLSOptions.caFile = "NONE";
