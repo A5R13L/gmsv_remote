@@ -8,6 +8,7 @@ IFileSystem *g_pFullFileSystem = nullptr;
 
 IVEngineServer *g_pVEngineServer = nullptr;
 ICvar *g_pCvar = nullptr;
+ConCommand *gmsv_remote_toggle_log_activity_command = nullptr;
 
 namespace Remote::Core
 {
@@ -37,6 +38,20 @@ void Initialize(GarrysMod::Lua::ILuaBase *LUA)
         return;
     }
 
+    ConVar_Register();
+
+    gmsv_remote_toggle_log_activity_command = new ConCommand(
+        "gmsv_remote_toggle_log_activity",
+        [](const CCommand &args) {
+            Functions::g_LogActivity = !Functions::g_LogActivity;
+
+            Logger::Log(Logger::Info("Activity logging: %s{white}."),
+                        Functions::g_LogActivity ? "{green}enabled" : "{red}disabled");
+        },
+        "Toggle logging of activity to the relay.");
+
+    g_pCvar->RegisterConCommand(gmsv_remote_toggle_log_activity_command);
+
     Logger::Log(Logger::Info("gmsv_remote loaded."));
     Logger::Log(Logger::Info("Version: {green}" REMOTE_VERSION "{white}."));
 
@@ -52,10 +67,8 @@ void Initialize(GarrysMod::Lua::ILuaBase *LUA)
         return;
     }
 
-    std::string EncryptionKey = JSON::String(Config, "encryption_key");
-
-    if (!EncryptionKey.empty())
-        Functions::g_RemoteEncryptionKey = EncryptionKey;
+    Functions::g_RemoteEncryptionKey = JSON::String(Config, "encryption_key");
+    Functions::g_LogActivity = JSON::Boolean(Config, "log_activity");
 
     std::string Relay = JSON::String(Config, "relay");
 
@@ -65,6 +78,10 @@ void Initialize(GarrysMod::Lua::ILuaBase *LUA)
 
 void Shutdown(GarrysMod::Lua::ILuaBase *LUA)
 {
+    ConVar_Unregister();
+    Functions::DisconnectRelay();
+
+    delete gmsv_remote_toggle_log_activity_command;
 }
 
 nlohmann::json LoadConfig(const std::filesystem::path &Path)
@@ -81,8 +98,10 @@ nlohmann::json LoadConfig(const std::filesystem::path &Path)
         Logger::Log(Logger::Info("It looks like it's your first time running gmsv_remote. Setting up..."));
         std::filesystem::create_directory(FolderPath);
 
-        Config = nlohmann::json::object(
-            {{"password", DefaultPassword}, {"encryption_key", ""}, {"relay", "wss://gmsv_remote.asrieldev.workers.dev"}});
+        Config = nlohmann::json::object({{"password", DefaultPassword},
+                                         {"encryption_key", ""},
+                                         {"relay", "wss://gmsv_remote.asrieldev.workers.dev"},
+                                         {"log_activity", false}});
 
         std::string ConfigString = Config.dump(1, '\t');
 

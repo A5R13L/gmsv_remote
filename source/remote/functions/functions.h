@@ -4,7 +4,7 @@
 namespace Remote::Functions
 {
 extern std::string g_RemoteEncryptionKey;
-extern std::string g_LogActivity;
+extern bool g_LogActivity;
 
 std::string RandomString(int Length);
 std::string GetServerAddress();
@@ -19,4 +19,5 @@ std::string Decode(const std::string &Data);
 std::string Base64Encode(const std::string &Data);
 std::string Base64Decode(const std::string &Data);
 void ConnectRelay(const std::string &RelayURL, const std::string &Password);
+void DisconnectRelay();
 } // namespace Remote::Functions

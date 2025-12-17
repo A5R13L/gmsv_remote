@@ -33,11 +33,14 @@ void SocketServer::Connect(const std::string &_RelayURL, const std::string &_Pas
     this->RelayURL = _RelayURL;
     this->Password = _Password;
 
+#ifdef SYSTEM_LINUX
     ix::SocketTLSOptions TLSOptions;
     TLSOptions.disable_hostname_validation = true;
     TLSOptions.caFile = "NONE";
 
     g_WebSocket.setTLSOptions(TLSOptions);
+#endif
+
     g_WebSocket.setExtraHeaders({{"Sec-WebSocket-Protocol", "gmsv_remote"}});
     g_WebSocket.setUrl(_RelayURL);
     g_WebSocket.disablePerMessageDeflate();
@@ -99,7 +102,10 @@ void SocketServer::Connect(const std::string &_RelayURL, const std::string &_Pas
 
 void SocketServer::Disconnect()
 {
-    g_WebSocket.close();
+    if (!Connected)
+        return;
+
+    g_WebSocket.stop();
     Connected = false;
 }
 
@@ -114,9 +120,13 @@ void SocketServer::HandlePacket(const nlohmann::json &Packet)
         Logger::Log(Logger::Info("Server successfully announced to relay."));
     else if (Type == "client_hello")
     {
-        g_WebSocket.sendText(JSON::Stringify({{"type", "client_notify"},
-                                              {"clientTempId", JSON::String(Packet, "clientTempId")},
-                                              {"serverName", Functions::GetServerName()}}));
+        std::string ClientTempId = JSON::String(Packet, "clientTempId");
+
+        g_WebSocket.sendText(JSON::Stringify(
+            {{"type", "client_notify"}, {"clientTempId", ClientTempId}, {"serverName", Functions::GetServerName()}}));
+
+        if (Functions::g_LogActivity)
+            Logger::Log(Logger::Info("Client {cyan}%s{white} connected to server."), ClientTempId.c_str());
     }
     else if (Type == "client_rpc")
     {
@@ -243,6 +253,10 @@ void SocketServer::HandleListFiles(std::string ClientId, int RequestId, const nl
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
+    if (Functions::g_LogActivity)
+        Logger::Log(Logger::Info("Client {cyan}%s{white} requested the the contents of directory: {cyan}%s{white}."),
+                    ClientId.c_str(), Path.c_str());
+
     Response["success"] = true;
     Response["entries"] = nlohmann::json::array();
 
@@ -284,6 +298,10 @@ void SocketServer::HandleRead(std::string ClientId, int RequestId, const nlohman
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
+    if (Functions::g_LogActivity)
+        Logger::Log(Logger::Info("Client {cyan}%s{white} requested to read the contents of file: {cyan}%s{white}."),
+                    ClientId.c_str(), Path.c_str());
+
     std::ifstream FileStream(FullPath, std::ios::binary);
 
     if (!FileStream)
@@ -313,11 +331,10 @@ void SocketServer::HandleRead(std::string ClientId, int RequestId, const nlohman
 
     this->StartRPCStream(ClientId, RequestId);
     auto NextChunkTime = std::chrono::steady_clock::now();
-    std::string ChunkString(FILE_READ_CHUNK_BYTES, '\0');
+    std::string ChunkString;
 
     while (FileStream)
     {
-        std::this_thread::sleep_until(NextChunkTime);
         FileStream.read(ChunkBuffer.data(), ChunkBuffer.size());
 
         std::streamsize BytesRead = FileStream.gcount();
@@ -329,7 +346,8 @@ void SocketServer::HandleRead(std::string ClientId, int RequestId, const nlohman
         std::memcpy(ChunkString.data(), ChunkBuffer.data(), BytesRead);
         this->SendRPCStreamChunk(ClientId, RequestId, ChunkString);
 
-        NextChunkTime = std::max(NextChunkTime + FILE_READ_CHUNK_INTERVAL, std::chrono::steady_clock::now());
+        NextChunkTime += FILE_READ_CHUNK_INTERVAL;
+        std::this_thread::sleep_until(NextChunkTime);
     }
 
     this->StopRPCStream(ClientId, RequestId);
@@ -357,6 +375,12 @@ void SocketServer::HandleWrite(std::string ClientId, int RequestId, const nlohma
 
     std::string DecodedData = Functions::Base64Decode(Data);
     std::fstream FileStream(FullPath, std::ios::binary | std::ios::in | std::ios::out | std::ios::ate);
+
+    if (Functions::g_LogActivity)
+        Logger::Log(
+            Logger::Info(
+                "Client {cyan}%s{white} requested to write to file: {cyan}%s{white} with {cyan}%d{white} byte%s."),
+            ClientId.c_str(), Path.c_str(), DecodedData.size(), DecodedData.size() == 1 ? "" : "s");
 
     if (!FileStream)
     {
@@ -389,9 +413,15 @@ void SocketServer::HandleDelete(std::string ClientId, int RequestId, const nlohm
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
+    bool IsDirectory = std::filesystem::is_directory(FullPath);
+
+    if (Functions::g_LogActivity)
+        Logger::Log(Logger::Info("Client {cyan}%s{white} requested to delete %s: {cyan}%s{white}."), ClientId.c_str(),
+                    IsDirectory ? "directory" : "file", Path.c_str());
+
     try
     {
-        if (std::filesystem::is_directory(FullPath))
+        if (IsDirectory)
             std::filesystem::remove_all(FullPath);
         else
             std::filesystem::remove(FullPath);
@@ -456,6 +486,11 @@ void SocketServer::HandleRename(std::string ClientId, int RequestId, const nlohm
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
+    if (Functions::g_LogActivity)
+        Logger::Log(
+            Logger::Info("Client {cyan}%s{white} requested to rename file: {cyan}%s{white} to: {cyan}%s{white}."),
+            ClientId.c_str(), From.c_str(), To.c_str());
+
     try
     {
         std::filesystem::create_directories(std::filesystem::path(ToFullPath).parent_path());
@@ -493,6 +528,10 @@ void SocketServer::HandleCopy(std::string ClientId, int RequestId, const nlohman
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
 
+    if (Functions::g_LogActivity)
+        Logger::Log(Logger::Info("Client {cyan}%s{white} requested to copy file: {cyan}%s{white} to: {cyan}%s{white}."),
+                    ClientId.c_str(), From.c_str(), To.c_str());
+
     try
     {
         std::filesystem::create_directories(std::filesystem::path(ToFullPath).parent_path());
@@ -529,6 +568,10 @@ void SocketServer::HandleMove(std::string ClientId, int RequestId, const nlohman
 
         return this->SendRPCResponse(ClientId, RequestId, Response);
     }
+
+    if (Functions::g_LogActivity)
+        Logger::Log(Logger::Info("Client {cyan}%s{white} requested to move file: {cyan}%s{white} to: {cyan}%s{white}."),
+                    ClientId.c_str(), From.c_str(), To.c_str());
 
     try
     {

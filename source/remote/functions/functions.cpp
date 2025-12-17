@@ -6,6 +6,7 @@
 namespace Remote::Functions
 {
 std::string g_RemoteEncryptionKey;
+bool g_LogActivity = false;
 
 std::string RandomChar()
 {
@@ -180,5 +181,11 @@ void ConnectRelay(const std::string &RelayURL, const std::string &Password)
 {
     ix::initNetSystem();
     Socket::SocketServer::Singleton.Connect(RelayURL, Password);
+}
+
+void DisconnectRelay()
+{
+    ix::uninitNetSystem();
+    Socket::SocketServer::Singleton.Disconnect();
 }
 } // namespace Remote::Functions
